@@ -1285,10 +1285,6 @@ func (u *UIMService) GetNativeSPN(ctx context.Context) (string, error) {
 
 func (u *UIMService) GetSIMMetadata(ctx context.Context) (*SIMMetadata, error) {
 	meta := &SIMMetadata{}
-	if mcc, mnc, err := u.GetNativeMCCMNC(ctx); err == nil {
-		meta.NativeMCC = mcc
-		meta.NativeMNC = mnc
-	}
 	if gid, err := u.GetGID1(ctx); err == nil {
 		meta.GID1 = gid
 	}
@@ -1303,6 +1299,13 @@ func (u *UIMService) GetSIMMetadata(ctx context.Context) (*SIMMetadata, error) {
 	}
 	if opl, err := u.GetOPLRecords(ctx); err == nil {
 		meta.OPL = opl
+	}
+	if mcc, mnc, ok := nativeMCCMNCFromOPLRecords(meta.OPL); ok {
+		meta.NativeMCC = mcc
+		meta.NativeMNC = mnc
+	} else if mcc, mnc, err := u.getNativeMCCMNCFromIMSI(ctx); err == nil {
+		meta.NativeMCC = mcc
+		meta.NativeMNC = mnc
 	}
 	if meta.NativeMCC == "" && meta.NativeMNC == "" && meta.GID1 == "" && meta.GID2 == "" && meta.ServiceTable == nil && len(meta.PNN) == 0 && len(meta.OPL) == 0 {
 		return meta, fmt.Errorf("sim_metadata_empty")
@@ -1477,6 +1480,15 @@ func (u *UIMService) readOPLRecords(ctx context.Context, fileID uint16) ([]OPLRe
 }
 
 func (u *UIMService) GetNativeMCCMNC(ctx context.Context) (mcc string, mnc string, err error) {
+	if opl, oplErr := u.GetOPLRecords(ctx); oplErr == nil {
+		if mcc, mnc, ok := nativeMCCMNCFromOPLRecords(opl); ok {
+			return mcc, mnc, nil
+		}
+	}
+	return u.getNativeMCCMNCFromIMSI(ctx)
+}
+
+func (u *UIMService) getNativeMCCMNCFromIMSI(ctx context.Context) (mcc string, mnc string, err error) {
 	// 1. 获取 IMSI
 	imsi, err := u.GetIMSI(ctx)
 	if err != nil {
@@ -1616,6 +1628,29 @@ func decodeOPLRecord(record int, data []byte) (OPLRecord, bool) {
 		RawHex:    raw,
 	}
 	return out, out.PLMN != "" || out.RawHex != ""
+}
+
+func nativeMCCMNCFromOPLRecords(records []OPLRecord) (mcc string, mnc string, ok bool) {
+	for _, rec := range records {
+		plmn := strings.TrimSpace(rec.PLMN)
+		if len(plmn) != 5 && len(plmn) != 6 {
+			continue
+		}
+		if !isExactDecimalPLMN(plmn) {
+			continue
+		}
+		return plmn[:3], plmn[3:], true
+	}
+	return "", "", false
+}
+
+func isExactDecimalPLMN(plmn string) bool {
+	for i := 0; i < len(plmn); i++ {
+		if plmn[i] < '0' || plmn[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func decodeSIMServiceTable(kind string, data []byte) *SIMServiceTable {
