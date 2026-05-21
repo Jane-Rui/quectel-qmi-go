@@ -3601,8 +3601,13 @@ func (m *Manager) ReadSMS(storageType uint8, index uint32) (*DecodedSMS, error) 
 		return nil, fmt.Errorf("invalid PDU: SMSC length mismatch")
 	}
 
+	tpduBytes := raw[tpduOffset:]
+	if trimmed, ok := trimDeliverTPDUToDeclaredLength(tpduBytes); ok {
+		tpduBytes = trimmed
+	}
+
 	pd := &tpdu.TPDU{}
-	if err := pd.UnmarshalBinary(raw[tpduOffset:]); err != nil {
+	if err := pd.UnmarshalBinary(tpduBytes); err != nil {
 		return nil, fmt.Errorf("PDU unmarshal failed: %w", err)
 	}
 
