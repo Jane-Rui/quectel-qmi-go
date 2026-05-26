@@ -81,13 +81,15 @@ type Config struct {
 	MuxID        uint8 // QMAP Mux ID (对应 -m 参数, 默认 0 表示不启用多路复用)
 	NoDial       bool  // Only open QMI services, don't perform WDS dialing / 仅打开 QMI 服务, 不进行 WDS 拨号
 
-	DataPlanePolicy DataPlanePolicy // Data-plane service allocation policy / 数据面服务分配策略
-	Timeouts        TimeoutConfig
-	RetryPolicy     RetryPolicy
-	HealthPolicy    HealthPolicy
-	EventPolicy     EventPolicy
-	RecoveryPolicy  RecoveryPolicy
-	ClientOptions   qmi.ClientOptions
+	DataPlanePolicy          DataPlanePolicy // Data-plane service allocation policy / 数据面服务分配策略
+	PowerCycleSIMOnStartCore bool            // Power-cycle SIM during StartCore before SIM check / StartCore 中先重启 SIM 供电再检查 SIM
+	SIMPowerCycleSlot        uint8           // SIM slot for startup power-cycle, defaults to 1 when enabled / 启动 SIM 重新上电的卡槽，启用时默认 1
+	Timeouts                 TimeoutConfig
+	RetryPolicy              RetryPolicy
+	HealthPolicy             HealthPolicy
+	EventPolicy              EventPolicy
+	RecoveryPolicy           RecoveryPolicy
+	ClientOptions            qmi.ClientOptions
 }
 
 type TimeoutConfig struct {
@@ -264,6 +266,7 @@ type Manager struct {
 	openLogicalChannelHook            func(ctx context.Context, slot uint8, aid []byte) (byte, error)
 	closeLogicalChannelHook           func(ctx context.Context, slot uint8, channel uint8) error
 	sendAPDUHook                      func(ctx context.Context, slot uint8, channel uint8, command []byte) ([]byte, error)
+	startupSIMPowerCycleHook          func(ctx context.Context) error
 	newWDSService                     func(ctx context.Context, client *qmi.Client) (*qmi.WDSService, error)
 	newNASService                     func(ctx context.Context, client *qmi.Client) (*qmi.NASService, error)
 	newDMSService                     func(ctx context.Context, client *qmi.Client) (*qmi.DMSService, error)
@@ -350,6 +353,10 @@ const defaultModemResetQuietWindow = 3 * time.Second
 const defaultPostRegRefreshDelay = 800 * time.Millisecond
 const defaultPostRegRefreshTimeout = 4 * time.Second
 const defaultPostRegRefreshCooldown = 2 * time.Second
+const defaultStartupSIMPowerCycleSlot uint8 = 1
+const defaultStartupSIMPowerCycleOffSettle = 500 * time.Millisecond
+const defaultStartupSIMPowerCycleOnSettle = 1 * time.Second
+const defaultStartupSIMPowerCycleTimeout = 8 * time.Second
 const recoverBackoffBase = 500 * time.Millisecond
 const recoverBackoffMax = 15 * time.Second
 const recoverBackoffJitterRatio = 0.2
@@ -423,6 +430,9 @@ func normalizeConfig(cfg Config) Config {
 	}
 	if cfg.RecoveryPolicy.ServiceRecoverCooldown <= 0 {
 		cfg.RecoveryPolicy.ServiceRecoverCooldown = defaultUIMRecoverCooldown
+	}
+	if cfg.PowerCycleSIMOnStartCore && cfg.SIMPowerCycleSlot == 0 {
+		cfg.SIMPowerCycleSlot = defaultStartupSIMPowerCycleSlot
 	}
 	defaultClientOpts := qmi.DefaultClientOptions()
 	if cfg.ClientOptions.ReadDeadline <= 0 {
@@ -521,10 +531,26 @@ func (m *Manager) StartCore() error {
 	m.desiredConnection = false
 	m.mu.Unlock()
 
-	if err := m.openClientAndAllocateServices(); err != nil {
+	openErr := error(nil)
+	if m.openClientAndAllocateServicesHook != nil {
+		openErr = m.openClientAndAllocateServicesHook()
+	} else {
+		openErr = m.openClientAndAllocateServices()
+	}
+	if openErr != nil {
 		m.cleanup()
 		m.setState(StateDisconnected)
-		return err
+		return openErr
+	}
+
+	if err := m.powerCycleSIMForStartCore(); err != nil {
+		if isStartupSIMPowerCycleUnsupported(err) {
+			m.log.WithError(err).Warn("Startup SIM power cycle unsupported; continuing")
+		} else {
+			m.cleanup()
+			m.setState(StateDisconnected)
+			return fmt.Errorf("startup SIM power cycle failed: %w", err)
+		}
 	}
 
 	// Check SIM status / 检查SIM卡状态
@@ -886,6 +912,78 @@ func maxDuration(a, b time.Duration) time.Duration {
 		return a
 	}
 	return b
+}
+
+func sleepWithContext(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func (m *Manager) powerCycleSIMForStartCore() error {
+	if m == nil || !m.cfg.PowerCycleSIMOnStartCore {
+		return nil
+	}
+	timeout := maxDuration(m.cfg.Timeouts.SIMCheck, defaultStartupSIMPowerCycleTimeout)
+	ctx, cancel := m.opContext(timeout)
+	defer cancel()
+	if m.startupSIMPowerCycleHook != nil {
+		return m.startupSIMPowerCycleHook(ctx)
+	}
+
+	slot := m.cfg.SIMPowerCycleSlot
+	if slot == 0 {
+		slot = defaultStartupSIMPowerCycleSlot
+	}
+	m.log.WithField("slot", slot).Info("Startup SIM power cycle begin")
+
+	if err := m.UIMPowerOffSIM(ctx, slot); err != nil {
+		if isStartupSIMPowerCycleUnsupported(err) {
+			return err
+		}
+		m.log.WithError(err).WithField("slot", slot).Warn("Startup SIM power-off failed; continuing without SIM power cycle")
+		return nil
+	}
+	if err := sleepWithContext(ctx, defaultStartupSIMPowerCycleOffSettle); err != nil {
+		return fmt.Errorf("wait after startup SIM power-off: %w", err)
+	}
+	if err := m.UIMPowerOnSIM(ctx, slot); err != nil {
+		return fmt.Errorf("power on SIM after startup power-off: %w", err)
+	}
+	if err := sleepWithContext(ctx, defaultStartupSIMPowerCycleOnSettle); err != nil {
+		return fmt.Errorf("wait after startup SIM power-on: %w", err)
+	}
+
+	m.log.WithField("slot", slot).Info("Startup SIM power cycle complete")
+	return nil
+}
+
+func isStartupSIMPowerCycleUnsupported(err error) bool {
+	if err == nil {
+		return false
+	}
+	var unsupported *qmi.NotSupportedError
+	if errors.As(err, &unsupported) {
+		return true
+	}
+	var qmiErr *qmi.QMIError
+	if !errors.As(err, &qmiErr) || qmiErr == nil {
+		return false
+	}
+	switch qmiErr.ErrorCode {
+	case qmi.QMIErrInvalidQmiCmd, qmi.QMIErrNotSupported, qmi.QMIErrOpDeviceUnsupported:
+		return true
+	default:
+		return false
+	}
 }
 
 func (m *Manager) createWDSService(ctx context.Context) (*qmi.WDSService, error) {
@@ -2305,6 +2403,9 @@ func (m *Manager) enableRawIP(parent context.Context) error {
 }
 
 func (m *Manager) checkSIM() error {
+	if m != nil && m.checkSIMHook != nil {
+		return m.checkSIMHook()
+	}
 	status := qmi.SIMAbsent
 	var err error
 	ctx, cancel := m.opContext(m.cfg.Timeouts.SIMCheck)

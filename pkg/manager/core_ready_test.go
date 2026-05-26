@@ -31,6 +31,85 @@ func TestDoRecoverFromModemResetResetsSnapshotImmediately(t *testing.T) {
 	}
 }
 
+func TestStartCorePowerCyclesSIMBeforeCheckSIMWhenEnabled(t *testing.T) {
+	m := newRecoveryTestManager()
+	m.cfg.PowerCycleSIMOnStartCore = true
+	m.cfg = normalizeConfig(m.cfg)
+
+	var events []string
+	m.openClientAndAllocateServicesHook = func() error {
+		events = append(events, "open")
+		return nil
+	}
+	m.startupSIMPowerCycleHook = func(ctx context.Context) error {
+		events = append(events, "power_cycle")
+		return nil
+	}
+	m.checkSIMHook = func() error {
+		events = append(events, "check_sim")
+		return nil
+	}
+
+	if err := m.StartCore(); err != nil {
+		t.Fatalf("StartCore() error = %v", err)
+	}
+	t.Cleanup(func() { _ = m.Stop() })
+
+	want := []string{"open", "power_cycle", "check_sim"}
+	if fmt.Sprint(events) != fmt.Sprint(want) {
+		t.Fatalf("events=%v want %v", events, want)
+	}
+}
+
+func TestStartCoreContinuesWhenStartupSIMPowerCycleUnsupported(t *testing.T) {
+	m := newRecoveryTestManager()
+	m.cfg.PowerCycleSIMOnStartCore = true
+	m.cfg = normalizeConfig(m.cfg)
+	m.openClientAndAllocateServicesHook = func() error { return nil }
+	m.startupSIMPowerCycleHook = func(ctx context.Context) error {
+		return &qmi.NotSupportedError{Operation: "power off SIM"}
+	}
+
+	checkCalls := 0
+	m.checkSIMHook = func() error {
+		checkCalls++
+		return nil
+	}
+
+	if err := m.StartCore(); err != nil {
+		t.Fatalf("StartCore() error = %v", err)
+	}
+	t.Cleanup(func() { _ = m.Stop() })
+	if checkCalls != 1 {
+		t.Fatalf("checkSIM calls=%d want 1", checkCalls)
+	}
+}
+
+func TestStartCoreFailsWhenStartupSIMPowerCycleFails(t *testing.T) {
+	m := newRecoveryTestManager()
+	m.cfg.PowerCycleSIMOnStartCore = true
+	m.cfg = normalizeConfig(m.cfg)
+	m.openClientAndAllocateServicesHook = func() error { return nil }
+	m.startupSIMPowerCycleHook = func(ctx context.Context) error {
+		return fmt.Errorf("power on SIM after startup power-off: modem rejected command")
+	}
+	m.checkSIMHook = func() error {
+		t.Fatal("checkSIM should not run after fatal startup SIM power-cycle failure")
+		return nil
+	}
+
+	err := m.StartCore()
+	if err == nil {
+		t.Fatal("StartCore() error = nil, want startup SIM power-cycle failure")
+	}
+	if !strings.Contains(err.Error(), "startup SIM power cycle failed") {
+		t.Fatalf("StartCore() error = %v, want startup SIM power-cycle context", err)
+	}
+	if m.IsCoreReady() {
+		t.Fatal("coreReady should stay false after startup SIM power-cycle failure")
+	}
+}
+
 func TestDoRecoverFromModemResetIdentityGateBlocksCoreReady(t *testing.T) {
 	m := newRecoveryTestManager()
 	m.cfg.Timeouts.SIMCheck = 80 * time.Millisecond
