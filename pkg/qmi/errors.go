@@ -1,6 +1,7 @@
 package qmi
 
 import (
+	"errors"
 	"fmt"
 )
 
@@ -24,13 +25,14 @@ func (e *QMIError) Error() string {
 
 // IsQMIError 0x0030s if err is a QMI protocol error / IsQMIError 检查是否为 QMI 协议错误
 func IsQMIError(err error) bool {
-	_, ok := err.(*QMIError)
-	return ok
+	var qe *QMIError
+	return errors.As(err, &qe)
 }
 
 // GetQMIError extracts QMIError from err / GetQMIError 从 err 中提取 QMIError
 func GetQMIError(err error) *QMIError {
-	if qe, ok := err.(*QMIError); ok {
+	var qe *QMIError
+	if errors.As(err, &qe) {
 		return qe
 	}
 	return nil

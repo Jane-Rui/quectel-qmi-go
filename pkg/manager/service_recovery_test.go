@@ -202,6 +202,43 @@ func TestDMSRecoveryRebindThenRetrySuccess(t *testing.T) {
 	}
 }
 
+func TestDMSRecoveryRebindsWrappedSetOperatingModeError(t *testing.T) {
+	m := newRecoveryTestManager()
+	m.ensureDMSServiceHook = func() (*qmi.DMSService, error) { return &qmi.DMSService{}, nil }
+
+	rebindCalls := 0
+	m.rebindDMSServiceHook = func(reason string) (*qmi.DMSService, error) {
+		rebindCalls++
+		if reason != "recover:SetOperatingMode" {
+			t.Fatalf("unexpected rebind reason: %q", reason)
+		}
+		return &qmi.DMSService{}, nil
+	}
+
+	attempts := 0
+	err := m.withDMSRecovery("SetOperatingMode", func(dms *qmi.DMSService) error {
+		attempts++
+		if attempts == 1 {
+			return fmt.Errorf("set operating mode failed: %w", &qmi.QMIError{
+				Service:   qmi.ServiceDMS,
+				MessageID: qmi.DMSSetOperatingMode,
+				Result:    0x0001,
+				ErrorCode: qmi.QMIErrDeviceNotReady,
+			})
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("expected retry success, got error: %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("expected 2 attempts, got %d", attempts)
+	}
+	if rebindCalls != 1 {
+		t.Fatalf("expected 1 rebind call, got %d", rebindCalls)
+	}
+}
+
 func TestNASRecoveryRebindThenRetrySuccess(t *testing.T) {
 	m := newRecoveryTestManager()
 	m.ensureNASServiceHook = func() (*qmi.NASService, error) { return &qmi.NASService{}, nil }
