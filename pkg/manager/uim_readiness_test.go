@@ -3,7 +3,10 @@ package manager
 import (
 	"context"
 	"errors"
+	"reflect"
+	"strings"
 	"testing"
+	"unsafe"
 
 	"github.com/iniwex5/quectel-qmi-go/pkg/qmi"
 )
@@ -135,4 +138,161 @@ func TestGetUIMReadinessUsesUIMRecoveryWrapperForCardStatus(t *testing.T) {
 	if got.Reason != UIMReadinessControlUnavailable {
 		t.Fatalf("reason=%q want %q", got.Reason, UIMReadinessControlUnavailable)
 	}
+}
+
+func TestGetUIMReadinessReturnsNilErrorForNonFatalSlotStatusFailure(t *testing.T) {
+	slotErr := errors.New("QMI error: service=0x0b msg=0x0047 result=0x0001 error=0x0034")
+	var calls int
+	m := &Manager{}
+	m.ensureUIMServiceHook = func() (*qmi.UIMService, error) {
+		calls++
+		switch calls {
+		case 1:
+			return newUIMReadinessTestService(t, func(req *qmi.Packet) (*qmi.Packet, error) {
+				if req.MessageID != qmi.UIMGetCardStatus {
+					return nil, errors.New("unexpected UIM card status request")
+				}
+				return uimReadinessCardStatusPacket(0x01), nil
+			}), nil
+		case 2:
+			return newUIMReadinessTestService(t, func(req *qmi.Packet) (*qmi.Packet, error) {
+				if req.MessageID != qmi.UIMGetSlotStatus {
+					return nil, errors.New("unexpected UIM slot status request")
+				}
+				return nil, slotErr
+			}), nil
+		default:
+			return nil, errors.New("unexpected UIM ensure call")
+		}
+	}
+	m.getICCIDStrictHook = func(ctx context.Context) (string, error) { return "8985203103011907194", nil }
+	m.getIMSIStrictHook = func(ctx context.Context) (string, error) { return "460011234567890", nil }
+
+	got, err := m.GetUIMReadiness(context.Background())
+
+	if err != nil {
+		t.Fatalf("GetUIMReadiness() err=%v, want nil for nonfatal slot status failure", err)
+	}
+	if got.Reason != UIMReadinessReady {
+		t.Fatalf("reason=%q want %q", got.Reason, UIMReadinessReady)
+	}
+	if got.Err == nil || !strings.Contains(got.Err.Error(), slotErr.Error()) {
+		t.Fatalf("diagnostic err=%v, want slot status error", got.Err)
+	}
+}
+
+func newUIMReadinessTestService(t *testing.T, handler func(*qmi.Packet) (*qmi.Packet, error)) *qmi.UIMService {
+	t.Helper()
+	client := newUIMReadinessTestClient(t)
+	serveUIMReadinessTestRequests(t, client, handler)
+
+	uim := &qmi.UIMService{}
+	setUnexportedField(t, reflect.ValueOf(uim).Elem().FieldByName("client"), reflect.ValueOf(client))
+	setUnexportedField(t, reflect.ValueOf(uim).Elem().FieldByName("clientID"), reflect.ValueOf(uint8(1)))
+	return uim
+}
+
+func newUIMReadinessTestClient(t *testing.T) *qmi.Client {
+	t.Helper()
+	client := &qmi.Client{}
+	v := reflect.ValueOf(client).Elem()
+	for _, field := range []struct {
+		name string
+		size int
+	}{
+		{name: "eventCh", size: 1},
+		{name: "indicationInCh", size: 1},
+		{name: "writeCh", size: 16},
+	} {
+		f := v.FieldByName(field.name)
+		setUnexportedField(t, f, reflect.MakeChan(f.Type(), field.size))
+	}
+	closeCh := v.FieldByName("closeCh")
+	setUnexportedField(t, closeCh, reflect.MakeChan(closeCh.Type(), 0))
+	transactions := v.FieldByName("transactions")
+	setUnexportedField(t, transactions, reflect.MakeMap(transactions.Type()))
+	recentTransactions := v.FieldByName("recentTransactions")
+	setUnexportedField(t, recentTransactions, reflect.MakeMap(recentTransactions.Type()))
+	setUnexportedField(t, v.FieldByName("opts"), reflect.ValueOf(qmi.DefaultClientOptions()))
+	return client
+}
+
+func serveUIMReadinessTestRequests(t *testing.T, client *qmi.Client, handler func(*qmi.Packet) (*qmi.Packet, error)) {
+	t.Helper()
+	done := make(chan struct{})
+	finished := make(chan struct{})
+	writeCh := getUnexportedField(t, reflect.ValueOf(client).Elem().FieldByName("writeCh"))
+
+	go func() {
+		defer close(finished)
+		for {
+			chosen, recv, ok := reflect.Select([]reflect.SelectCase{
+				{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(done)},
+				{Dir: reflect.SelectRecv, Chan: writeCh},
+			})
+			if chosen == 0 || !ok {
+				return
+			}
+
+			wr := reflect.New(recv.Type()).Elem()
+			wr.Set(recv)
+			data := append([]byte(nil), getUnexportedField(t, wr.FieldByName("data")).Bytes()...)
+			result := getUnexportedField(t, wr.FieldByName("result"))
+			req, err := qmi.UnmarshalPacket(data)
+			if err != nil {
+				result.Send(reflect.ValueOf(err))
+				continue
+			}
+
+			resp, handlerErr := handler(req)
+			if handlerErr != nil {
+				result.Send(reflect.ValueOf(handlerErr))
+				continue
+			}
+			result.Send(reflect.Zero(result.Type().Elem()))
+			if resp == nil {
+				continue
+			}
+
+			key := uint32(req.ServiceType)<<16 | uint32(req.TransactionID)
+			transactions := getUnexportedField(t, reflect.ValueOf(client).Elem().FieldByName("transactions"))
+			entry := transactions.MapIndex(reflect.ValueOf(key))
+			if !entry.IsValid() || entry.IsNil() {
+				t.Errorf("response channel not found for key=0x%08x", key)
+				continue
+			}
+			resp.ServiceType = req.ServiceType
+			resp.ClientID = req.ClientID
+			resp.TransactionID = req.TransactionID
+			resp.MessageID = req.MessageID
+			ch := getUnexportedField(t, entry.Elem().FieldByName("ch"))
+			ch.Send(reflect.ValueOf(resp))
+		}
+	}()
+
+	t.Cleanup(func() {
+		close(done)
+		<-finished
+	})
+}
+
+func uimReadinessCardStatusPacket(cardState uint8) *qmi.Packet {
+	value := make([]byte, 15)
+	value[8] = 1
+	value[9] = cardState
+	value[10] = byte(qmi.PINStatusDisabled)
+	return &qmi.Packet{TLVs: []qmi.TLV{
+		{Type: 0x02, Value: []byte{0x00, 0x00, 0x00, 0x00}},
+		{Type: 0x10, Value: value},
+	}}
+}
+
+func setUnexportedField(t *testing.T, field reflect.Value, value reflect.Value) {
+	t.Helper()
+	reflect.NewAt(field.Type(), unsafe.Pointer(field.UnsafeAddr())).Elem().Set(value)
+}
+
+func getUnexportedField(t *testing.T, field reflect.Value) reflect.Value {
+	t.Helper()
+	return reflect.NewAt(field.Type(), unsafe.Pointer(field.UnsafeAddr())).Elem()
 }

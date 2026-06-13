@@ -200,5 +200,8 @@ func (m *Manager) GetUIMReadiness(ctx context.Context) (UIMReadiness, error) {
 	if cardErr != nil {
 		return readiness, cardErr
 	}
-	return readiness, slotErr
+	if isUIMReadinessTransportFatal(slotErr) {
+		return readiness, slotErr
+	}
+	return readiness, nil
 }
