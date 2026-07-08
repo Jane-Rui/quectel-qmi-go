@@ -1,0 +1,55 @@
+name: Sync upstream (cm9vdA/quectel-qmi-go)
+
+on:
+  schedule:
+    - cron: '11 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Add upstream remote
+        run: git remote add upstream https://github.com/cm9vdA/quectel-qmi-go.git || true
+
+      - name: Fetch upstream
+        run: git fetch upstream master
+
+      - name: Check for new commits
+        id: check
+        run: |
+          LOCAL=$(git rev-parse HEAD)
+          UPSTREAM=$(git rev-parse upstream/master)
+          if [ "$LOCAL" = "$UPSTREAM" ]; then
+            echo "up_to_date=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "up_to_date=false" >> "$GITHUB_OUTPUT"
+            BEHIND=$(git rev-list HEAD..upstream/master --count)
+            echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create sync branch and PR
+        if: steps.check.outputs.up_to_date == 'false'
+        run: |
+          BRANCH="sync/upstream-$(date +%Y%m%d)"
+          git checkout -B "$BRANCH" upstream/master
+          git push origin "$BRANCH" --force-with-lease
+
+          gh pr create \
+            --base master \
+            --head "$BRANCH" \
+            --title "sync: 同步上游 cm9vdA/quectel-qmi-go (${{ steps.check.outputs.behind }} 个新提交)" \
+            --body "自动同步上游 \`cm9vdA/quectel-qmi-go\` 的最新变更。" \
+            || echo "PR 已存在或创建失败"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
