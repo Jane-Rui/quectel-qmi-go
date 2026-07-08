@@ -7,7 +7,6 @@ on:
 
 permissions:
   contents: write
-  pull-requests: write
 
 jobs:
   sync:
@@ -20,36 +19,27 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Add upstream remote
-        run: git remote add upstream https://github.com/cm9vdA/quectel-qmi-go.git || true
+        run: git remote add upstream https://github.com/cm9vdA/quectel-qmi-go.git 2>/dev/null || true
 
-      - name: Fetch upstream
-        run: git fetch upstream master
-
-      - name: Check for new commits
-        id: check
+      - name: Fetch and merge upstream
         run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git fetch upstream master
           LOCAL=$(git rev-parse HEAD)
           UPSTREAM=$(git rev-parse upstream/master)
+
           if [ "$LOCAL" = "$UPSTREAM" ]; then
-            echo "up_to_date=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "up_to_date=false" >> "$GITHUB_OUTPUT"
-            BEHIND=$(git rev-list HEAD..upstream/master --count)
-            echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
+            echo "已是最新，无需同步"
+            exit 0
           fi
 
-      - name: Create sync branch and PR
-        if: steps.check.outputs.up_to_date == 'false'
-        run: |
-          BRANCH="sync/upstream-$(date +%Y%m%d)"
-          git checkout -B "$BRANCH" upstream/master
-          git push origin "$BRANCH" --force-with-lease
+          BEHIND=$(git rev-list HEAD..upstream/master --count)
+          echo "上游有 ${BEHIND} 个新提交，开始合并..."
 
-          gh pr create \
-            --base master \
-            --head "$BRANCH" \
-            --title "sync: 同步上游 cm9vdA/quectel-qmi-go (${{ steps.check.outputs.behind }} 个新提交)" \
-            --body "自动同步上游 \`cm9vdA/quectel-qmi-go\` 的最新变更。" \
-            || echo "PR 已存在或创建失败"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          git merge upstream/master --no-edit -m "sync: 自动同步上游 cm9vdA/quectel-qmi-go (${BEHIND} 个新提交)"
+          git push origin master
+
+          echo "✅ 同步完成"
